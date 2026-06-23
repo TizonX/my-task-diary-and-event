@@ -5,7 +5,9 @@ export async function createReminder(payload) {
     relatedEntityType: payload.relatedEntityType,
     relatedEntityId: payload.relatedEntityId,
     scheduledAt: new Date(payload.scheduledAt),
-    status: payload.status || 'PENDING'
+    status: payload.status || 'PENDING',
+    chatId: payload.chatId || null,
+    message: payload.message || null,
   }
   return repo.createReminder(data)
 }

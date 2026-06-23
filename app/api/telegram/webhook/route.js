@@ -41,43 +41,31 @@ const toast = (callback_query_id, text) =>
 // NLP — intent detection & date extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-const REMINDER_RE = /\b(remind|reminder|every|weekly|daily|monthly|each|recurring|repeat)\b/i
 const EVENT_RE = /\b(meeting|call|standup|party|event|appointment|interview|lunch|dinner|breakfast|session|seminar|conference|hangout|outing|trip)\b/i
-const DATE_RE = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|next month|\d{1,2}\s*(am|pm)|\d{1,2}:\d{2})\b/i
 
-function detectIntent(text) {
-  if (REMINDER_RE.test(text)) return 'reminder'
-  if (EVENT_RE.test(text)) return 'event'
-  return 'task'
-}
+// ── Time helpers ──────────────────────────────────────────────────────────────
 
-function extractTime(text) {
-  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i)
+function parseTimeStr(timeStr, dayStr) {
+  if (!timeStr) return null
+  const m = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i)
   if (!m) return null
   let h = parseInt(m[1])
   const min = parseInt(m[2] || '0')
-  if (/pm/i.test(m[3]) && h < 12) h += 12
-  if (/am/i.test(m[3]) && h === 12) h = 0
-  return { h, min }
+  const ampm = (m[3] || '').toLowerCase()
+  if (ampm === 'pm' && h < 12) h += 12
+  if (ampm === 'am' && h === 12) h = 0
+  const now = new Date()
+  const d = new Date(now)
+  if (dayStr && /tomorrow/i.test(dayStr)) d.setDate(d.getDate() + 1)
+  d.setHours(h, min, 0, 0)
+  return d.toISOString()
 }
 
-function extractDate(text) {
+function resolveDay(text) {
   const now = new Date()
-  const time = extractTime(text)
-  function applyTime(d) {
-    if (time) d.setHours(time.h, time.min, 0, 0)
-    return d
-  }
-  if (/\btoday\b/i.test(text)) return applyTime(new Date(now)).toISOString()
-  if (/\btomorrow\b/i.test(text)) {
-    const d = new Date(now); d.setDate(d.getDate() + 1); return applyTime(d).toISOString()
-  }
-  if (/\bnext week\b/i.test(text)) {
-    const d = new Date(now); d.setDate(d.getDate() + 7); return applyTime(d).toISOString()
-  }
-  if (/\bnext month\b/i.test(text)) {
-    const d = new Date(now); d.setMonth(d.getMonth() + 1); return applyTime(d).toISOString()
-  }
+  if (/\btomorrow\b/i.test(text)) { const d = new Date(now); d.setDate(d.getDate() + 1); return d }
+  if (/\bnext week\b/i.test(text)) { const d = new Date(now); d.setDate(d.getDate() + 7); return d }
+  if (/\bnext month\b/i.test(text)) { const d = new Date(now); d.setMonth(d.getMonth() + 1); return d }
   const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday']
   for (let i = 0; i < days.length; i++) {
     if (new RegExp(`\\b${days[i]}\\b`, 'i').test(text)) {
@@ -85,19 +73,62 @@ function extractDate(text) {
       let diff = i - d.getDay()
       if (diff <= 0) diff += 7
       d.setDate(d.getDate() + diff)
-      return applyTime(d).toISOString()
+      return d
     }
   }
-  if (time) { const d = new Date(now); return applyTime(d).toISOString() }
-  return null
+  return new Date(now) // today
 }
 
-function cleanTitle(text) {
-  return text
-    .replace(/\b(remind me (to|about)?|every\s+\w+|tomorrow|today|next week|next month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
-    .replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, '')
-    .replace(/\s+/g, ' ').trim()
-    || text.trim()
+// Main NLP parser — returns { title, dueDate, notifyAt, intent }
+function parseNLMessage(text) {
+  let working = text
+
+  // 1. Extract notification instruction: "send me notification at Xpm today", "notify me at X"
+  const notifyRe = /(?:send\s+(?:me\s+)?(?:a\s+)?notification(?:\s+as\s+well)?|notify\s+me|send\s+notification)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(today|tomorrow)?/gi
+  let notifyAt = null
+  working = working.replace(notifyRe, (match, timeStr, dayStr) => {
+    notifyAt = parseTimeStr(timeStr, dayStr)
+    return ''
+  })
+
+  // 2. Extract due time: "at Xpm", "at X:XX"
+  let dueDate = null
+  const atTimeRe = /\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/gi
+  working = working.replace(atTimeRe, (match, timeStr) => {
+    if (!dueDate) {
+      const day = resolveDay(working)
+      const t = parseTimeStr(timeStr, '')
+      if (t) {
+        const base = new Date(t)
+        base.setFullYear(day.getFullYear(), day.getMonth(), day.getDate())
+        dueDate = base.toISOString()
+      }
+    }
+    return ''
+  })
+
+  // 3. Extract day keywords for due date
+  const dayBase = resolveDay(working)
+  if (!dueDate && /(tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|next month)/i.test(working)) {
+    dueDate = dayBase.toISOString()
+  }
+
+  // 4. Clean up day/time words from title
+  working = working
+    .replace(/\b(tomorrow|today|next week|next month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
+    .replace(/\bI have to\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s([.,!?])/g, '$1')
+    .replace(/^[.,\s]+|[.,\s]+$/g, '')
+    .trim()
+
+  const title = working || text.trim()
+
+  // 5. Intent
+  let intent = 'task'
+  if (EVENT_RE.test(text)) intent = 'event'
+
+  return { title, dueDate, notifyAt, intent }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -853,30 +884,34 @@ async function handleMessage(chatId, text, firstName) {
 
   // ── Natural language fallback ──
   if (!trimmed.startsWith('/')) {
-    const intent = detectIntent(trimmed)
-    const date = extractDate(trimmed)
-    const title = cleanTitle(trimmed)
-
-    if (intent === 'reminder') {
-      await send(chatId,
-        `🔔 *Reminder detected!*\n\n"${trimmed}"\n\nTo set a reminder, link it to a task ID:\n\`/remind <task-id> <date>\`\n\nOr tap below to create a task first:`,
-        { reply_markup: { inline_keyboard: [[{ text: '📝 Create Task First', callback_data: 'task_add' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
-      ); return
-    }
+    const { title, dueDate, notifyAt, intent } = parseNLMessage(trimmed)
 
     if (intent === 'event') {
-      const startDate = date || new Date().toISOString()
-      const e = await eventService.createEvent({ title: title || trimmed, startDate })
+      const e = await eventService.createEvent({ title, startDate: dueDate || new Date().toISOString() })
       await send(chatId,
-        `✅ *Event Created from your message!*\n━━━━━━━━━━━━━━━━━━━━\n${eventCard(e, 1)}`,
+        `✅ *Event Created!*\n━━━━━━━━━━━━━━━━━━━━\n${eventCard(e, 1)}`,
         { reply_markup: { inline_keyboard: [[{ text: '📅 My Events', callback_data: 'events_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
       ); return
     }
 
-    // Default: task
-    const t = await taskService.createTask({ title: title || trimmed, dueDate: date })
+    // Create task
+    const t = await taskService.createTask({ title, dueDate })
+
+    // Schedule reminder if notification time was mentioned
+    let reminderNote = ''
+    if (notifyAt) {
+      await reminderService.createReminder({
+        relatedEntityType: 'Task',
+        relatedEntityId: t.id,
+        scheduledAt: notifyAt,
+        chatId: String(chatId),
+        message: `🔔 *Reminder:* ${title}`,
+      })
+      reminderNote = `\n🔔 Notification scheduled for *${fmtDate(notifyAt)}*`
+    }
+
     await send(chatId,
-      `✅ *Task Created from your message!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`,
+      `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}${reminderNote}`,
       { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
     ); return
   }

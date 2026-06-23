@@ -35,13 +35,15 @@ model Event {
 }
 
 model Reminder {
-  id               String   @id @default(cuid())
+  id                String   @id @default(cuid())
   relatedEntityType String
-  relatedEntityId  String
-  scheduledAt      DateTime
-  status           String   @default("PENDING")
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  relatedEntityId   String
+  scheduledAt       DateTime
+  status            String   @default("PENDING")
+  chatId            String?
+  message           String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 }
 
 model TelegramUser {
