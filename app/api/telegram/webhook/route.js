@@ -6,6 +6,7 @@ import * as taskService from '../../../../server/services/taskService'
 import * as eventService from '../../../../server/services/eventService'
 import * as reminderService from '../../../../server/services/reminderService'
 import logger from '../../../../server/logger'
+import { detectTags } from '../../../../server/utils/autoTagger'
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const BASE_URL = process.env.BASE_URL || 'https://my-task-diary-and-event.vercel.app'
@@ -812,7 +813,8 @@ async function handleMessage(chatId, text, firstName) {
 
   if (cmd === '/add') {
     if (!rest) { await send(chatId, `❌ Usage: \`/add <title>\``); return }
-    const t = await taskService.createTask({ title: rest })
+    const autoTags = detectTags(rest)
+    const t = await taskService.createTask({ title: rest, tags: autoTags })
     await send(chatId, `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`, {
       reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
     }); return
@@ -894,8 +896,9 @@ async function handleMessage(chatId, text, firstName) {
       ); return
     }
 
-    // Create task
-    const t = await taskService.createTask({ title, dueDate })
+    // Create task with auto-detected tags from original message
+    const autoTags = detectTags(text)
+    const t = await taskService.createTask({ title, dueDate, tags: autoTags })
 
     // Schedule reminder if notification time was mentioned
     let reminderNote = ''
