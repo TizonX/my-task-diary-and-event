@@ -11,6 +11,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const BASE_URL = process.env.BASE_URL || 'https://my-task-diary-and-event.vercel.app'
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`
 const PAGE_SIZE = 3
+const MDEL_SIZE = 6
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram helpers
@@ -167,6 +168,7 @@ function tasksMenuKB() {
       [{ text: '➕ Add Task', callback_data: 'task_add' }, { text: '📋 All Tasks', callback_data: 'tasks_p_0' }],
       [{ text: '✅ Completed', callback_data: 'tasks_done_0' }, { text: '🔍 Search', callback_data: 'task_search' }],
       [{ text: '⚡ High Priority', callback_data: 'tasks_hi_0' }, { text: '🏷 By Tag', callback_data: 'task_bytag' }],
+      [{ text: '🗑 Multi-Delete', callback_data: 'mdel_s_0__' }],
       ...BACK_HOME,
     ],
   }
@@ -217,6 +219,87 @@ function paginationRow(page, total, prefix) {
   row.push({ text: `${page + 1}/${last + 1}`, callback_data: 'noop' })
   if (page < last) row.push({ text: 'Next ▶', callback_data: `${prefix}_${page + 1}` })
   return row
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-delete
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseSel(selStr) {
+  if (!selStr || selStr === '_' || selStr === '') return new Set()
+  return new Set(selStr.split(',').map(Number).filter(n => !isNaN(n)))
+}
+
+function encodeSel(sel) {
+  return sel.size > 0 ? [...sel].sort((a, b) => a - b).join(',') : '_'
+}
+
+async function buildMultiDeleteView(page = 0, selStr = '_') {
+  const all = await taskService.listTasks({})
+  const open = all.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE')
+
+  if (!open.length) return {
+    text: '📭 *No open tasks to delete.*',
+    kb: { inline_keyboard: [[{ text: '📝 Tasks Menu', callback_data: 'menu_tasks' }]] },
+  }
+
+  const sel = parseSel(selStr)
+  const totalPages = Math.ceil(open.length / MDEL_SIZE)
+  const slice = open.slice(page * MDEL_SIZE, (page + 1) * MDEL_SIZE)
+
+  let text = `🗑 *Multi-Delete* — Select tasks to delete\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  slice.forEach((t, i) => {
+    const gIdx = page * MDEL_SIZE + i
+    text += `${sel.has(gIdx) ? '✅' : '⬜'} *${gIdx + 1}.* ${t.title}\n`
+  })
+  if (sel.size > 0) text += `\n_${sel.size} task${sel.size > 1 ? 's' : ''} selected_`
+
+  const kb = { inline_keyboard: [] }
+
+  // One toggle button per task (full width, shows checkbox + title)
+  slice.forEach((t, i) => {
+    const gIdx = page * MDEL_SIZE + i
+    const checked = sel.has(gIdx)
+    const newSel = new Set(sel)
+    if (checked) newSel.delete(gIdx)
+    else newSel.add(gIdx)
+    const label = t.title.length > 32 ? t.title.slice(0, 31) + '…' : t.title
+    kb.inline_keyboard.push([{
+      text: `${checked ? '✅' : '⬜'} ${label}`,
+      callback_data: `mdel_s_${page}_${encodeSel(newSel)}`,
+    }])
+  })
+
+  // Select all / Deselect all for current page
+  const allPageChecked = slice.every((_, i) => sel.has(page * MDEL_SIZE + i))
+  const toggleAllSel = new Set(sel)
+  if (allPageChecked) {
+    slice.forEach((_, i) => toggleAllSel.delete(page * MDEL_SIZE + i))
+    kb.inline_keyboard.push([{ text: '☐ Deselect All on Page', callback_data: `mdel_s_${page}_${encodeSel(toggleAllSel)}` }])
+  } else {
+    slice.forEach((_, i) => toggleAllSel.add(page * MDEL_SIZE + i))
+    kb.inline_keyboard.push([{ text: '✅ Select All on Page', callback_data: `mdel_s_${page}_${encodeSel(toggleAllSel)}` }])
+  }
+
+  // Pagination (carry selection across pages)
+  if (totalPages > 1) {
+    const pRow = []
+    if (page > 0) pRow.push({ text: '◀ Prev', callback_data: `mdel_s_${page - 1}_${encodeSel(sel)}` })
+    pRow.push({ text: `${page + 1}/${totalPages}`, callback_data: 'noop' })
+    if (page < totalPages - 1) pRow.push({ text: 'Next ▶', callback_data: `mdel_s_${page + 1}_${encodeSel(sel)}` })
+    kb.inline_keyboard.push(pRow)
+  }
+
+  // Action row
+  if (sel.size > 0) {
+    kb.inline_keyboard.push([{
+      text: `🗑 Delete ${sel.size} Selected`,
+      callback_data: `mdel_confirm_${encodeSel(sel)}`,
+    }])
+  }
+  kb.inline_keyboard.push([{ text: '✗ Cancel', callback_data: 'menu_tasks' }])
+
+  return { text, kb, open }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -543,6 +626,47 @@ async function handleCallback(query) {
         ? `🏷 *Filter by tag:*\n\nUse \`/search <tag>\` to find tasks by tag.\n\nAvailable tags:\n${tags.map(t => `• \`${t}\``).join('\n')}`
         : `🏷 *No tags yet.*\n\nAdd tags using \`/tag <task-id> <tag>\``,
       { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+
+  // ── Multi-delete ──
+  if (data.startsWith('mdel_s_')) {
+    // mdel_s_{page}_{selStr}
+    const parts = data.slice(7).split('_')
+    const page = parseInt(parts[0]) || 0
+    const selStr = parts.slice(1).join('_')
+    const { text: t, kb } = await buildMultiDeleteView(page, selStr)
+    await edit(chatId, msgId, t, { reply_markup: kb }); return
+  }
+
+  if (data.startsWith('mdel_confirm_')) {
+    const selStr = data.slice(13)
+    const sel = parseSel(selStr)
+    const all = await taskService.listTasks({})
+    const open = all.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE')
+    const toDelete = [...sel].map(i => open[i]).filter(Boolean)
+    const titleList = toDelete.map(t => `• ${t.title}`).join('\n')
+    await edit(chatId, msgId,
+      `⚠️ *Delete ${toDelete.length} Task${toDelete.length > 1 ? 's' : ''}?*\n━━━━━━━━━━━━━━━━━━━━\n\n${titleList}\n\n_This cannot be undone._`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: `🗑 Yes, Delete All`, callback_data: `mdel_do_${selStr}` }, { text: '✗ Cancel', callback_data: `mdel_s_0_${selStr}` }],
+          ],
+        },
+      }
+    ); return
+  }
+
+  if (data.startsWith('mdel_do_')) {
+    const selStr = data.slice(8)
+    const sel = parseSel(selStr)
+    const all = await taskService.listTasks({})
+    const open = all.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE')
+    const toDelete = [...sel].map(i => open[i]).filter(Boolean)
+    await Promise.all(toDelete.map(t => taskService.deleteTask(t.id)))
+    await toast(query.id, `🗑 ${toDelete.length} task${toDelete.length > 1 ? 's' : ''} deleted!`)
+    const { text: listText, kb } = await buildTaskPage(0, 'all')
+    await edit(chatId, msgId, `🗑 *Deleted ${toDelete.length} task(s)*\n\n` + listText, { reply_markup: kb }); return
   }
 
   // ── Task actions ──
