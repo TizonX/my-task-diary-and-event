@@ -207,47 +207,72 @@ export function detectTags(text) {
 
 // ── Item splitter ─────────────────────────────────────────────────────────────
 
-const BUY_VERB_RE = /^(?:buy|get|purchase|pick\s+up|grab|order|bring|fetch|need\s+(?:to\s+)?(?:buy\s+)?|have\s+(?:to\s+)?(?:buy\s+)?|want\s+(?:to\s+)?(?:buy\s+)?)\s*/i
+// Build flat keyword set for O(1) lookup — used to detect space-separated item lists
+const KNOWN_ITEMS = new Set(TAG_RULES.flatMap(r => r.keywords).map(k => k.toLowerCase()))
+
+// Matches "I have to buy X", "need to get X", "buy X", etc. at the start of the string
+const BUY_VERB_RE = /^(?:i\s+)?(?:(?:have|need|want|would\s+like|gotta|got)\s+to\s+)?(?:also\s+)?(?:buy|get|purchase|pick\s+up|grab|order|bring|fetch)\s+/i
 
 function cleanItem(s) {
   return s.trim().replace(/^(?:a|an|the|some|few)\s+/i, '').trim()
 }
 
 function cap(s) {
+  if (!s) return s
   return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+// Further split a single item string by spaces if every word is a known product keyword
+// e.g. "milk bread" → ["Milk", "Bread"]  |  "Submit report" → ["Submit report"]
+function deepSplitBySpaces(item) {
+  const words = item.trim().split(/\s+/)
+  if (words.length >= 2 && words.every(w => KNOWN_ITEMS.has(w.toLowerCase()))) {
+    return words.map(cap)
+  }
+  return [cap(item)]
 }
 
 /**
  * Returns an array of item strings if the message is a list, otherwise null.
- * Handles:
- *   "Buy milk, bread and maggie"  → ["Milk", "Bread", "Maggie"]
- *   "milk bread maggie"           → ["Milk", "Bread", "Maggie"]
- *   "Buy shoes and shirt"         → ["Shoes", "Shirt"]
- *   "Buy groceries"               → null  (single item)
+ *
+ *   "I have to buy milk bread and maggie" → ["Milk", "Bread", "Maggie"]
+ *   "Buy milk, bread, maggie"             → ["Milk", "Bread", "Maggie"]
+ *   "milk bread and eggs"                 → ["Milk", "Bread", "Eggs"]
+ *   "Buy shoes and shirt"                 → ["Shoes", "Shirt"]
+ *   "Buy groceries"                       → null (single item)
  */
 export function splitIntoItems(text) {
   let working = text.trim()
+
+  // Remove notification instructions so they don't pollute item text
+  working = working
+    .replace(/(?:so\s+)?(?:send\s+(?:me\s+)?(?:a\s+)?notification|notify\s+me|give\s+me\s+(?:a\s+)?(?:reminder|notification)|remind\s+me|set\s+(?:a\s+)?reminder).*$/gi, '')
+    .trim()
 
   // Strip buy-type verb prefix
   const hadVerb = BUY_VERB_RE.test(working)
   if (hadVerb) working = working.replace(BUY_VERB_RE, '').trim()
 
-  // Strip trailing time/date phrases so they don't become items
+  // Strip date/time noise so they don't become items
   working = working
+    .replace(/\b(?:on\s+)?\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/gi, '')
     .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?/gi, '')
-    .replace(/\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week)\b/gi, '')
+    .replace(/\b(?:today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next\s+week|next\s+month)\b/gi, '')
+    .replace(/\b(?:so|also|please)\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
     .trim()
 
   if (!working) return null
 
-  // 1. Comma-separated (most explicit)
+  // 1. Comma-separated (most reliable signal of a list)
   if (working.includes(',')) {
     const parts = working
       .replace(/,\s*and\s+/gi, ',')
       .split(/,+/)
       .map(cleanItem)
       .filter(s => s.length > 0)
-    if (parts.length >= 2) return parts.map(cap)
+      .flatMap(deepSplitBySpaces)
+    if (parts.length >= 2) return parts
   }
 
   // 2. "and"-separated
@@ -255,12 +280,18 @@ export function splitIntoItems(text) {
     .split(/\s+and\s+/i)
     .map(cleanItem)
     .filter(s => s.length > 0)
-  if (andParts.length >= 2) return andParts.map(cap)
 
-  // 3. Space-separated after a buy verb — each word treated as an item
+  if (andParts.length >= 2) {
+    const expanded = andParts.flatMap(deepSplitBySpaces)
+    return expanded.length >= 2 ? expanded : null
+  }
+
+  // 3. After buy verb: space-separated words that are all known product keywords
   if (hadVerb) {
     const words = working.split(/\s+/).filter(s => s.length > 1)
-    if (words.length >= 2) return words.map(cap)
+    if (words.length >= 2 && words.every(w => KNOWN_ITEMS.has(w.toLowerCase()))) {
+      return words.map(cap)
+    }
   }
 
   return null

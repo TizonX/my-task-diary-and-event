@@ -80,20 +80,48 @@ function resolveDay(text) {
   return new Date(now) // today
 }
 
+const MONTH_MAP = {
+  jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11,
+  january:0, february:1, march:2, april:3, june:5, july:6, august:7, september:8,
+  october:9, november:10, december:11,
+}
+
+function parseSpecificDateWithTime(dayStr, monthStr, timeStr) {
+  const month = MONTH_MAP[monthStr.slice(0, 3).toLowerCase()]
+  const day = parseInt(dayStr)
+  if (month === undefined || !day || day > 31) return null
+  const now = new Date()
+  const d = new Date(now.getFullYear(), month, day)
+  if (d < now) d.setFullYear(d.getFullYear() + 1)
+  if (timeStr) {
+    const t = parseTimeStr(timeStr, '')
+    if (t) { const b = new Date(t); d.setHours(b.getHours(), b.getMinutes(), 0, 0) }
+  }
+  return d.toISOString()
+}
+
 // Main NLP parser — returns { title, dueDate, notifyAt, intent }
 function parseNLMessage(text) {
   let working = text
 
-  // 1. Extract notification instruction: "send me notification at Xpm today", "notify me at X"
-  const notifyRe = /(?:send\s+(?:me\s+)?(?:a\s+)?notification(?:\s+as\s+well)?|notify\s+me|send\s+notification)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(today|tomorrow)?/gi
   let notifyAt = null
-  working = working.replace(notifyRe, (match, timeStr, dayStr) => {
-    notifyAt = parseTimeStr(timeStr, dayStr)
+  let dueDate = null
+
+  // 1. Specific date in notification context: "on 24 Jun at 7pm" or "on Jun 24 at 7pm"
+  const specificDateRe = /\bon\s+(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?\b/gi
+  working = working.replace(specificDateRe, (match, d, mon, t) => {
+    if (!notifyAt) { const r = parseSpecificDateWithTime(d, mon, t); if (r) notifyAt = r }
     return ''
   })
 
-  // 2. Extract due time: "at Xpm", "at X:XX"
-  let dueDate = null
+  // 2. Notification instruction: "give me reminder at 7pm", "so remind me at X", "notify me at X"
+  const notifyRe = /(?:so\s+)?(?:send\s+(?:me\s+)?(?:a\s+)?notification(?:\s+as\s+well)?|notify\s+me|give\s+me\s+(?:a\s+)?(?:reminder|notification)(?:\s+as\s+well)?|remind\s+me(?:\s+about\s+it)?|set\s+(?:a\s+)?reminder)(?:\s+(?:at|for))?\s+(?:(today|tomorrow)\s+)?(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(today|tomorrow)?/gi
+  working = working.replace(notifyRe, (match, dayStr1, timeStr, dayStr2) => {
+    if (!notifyAt && timeStr) notifyAt = parseTimeStr(timeStr, dayStr1 || dayStr2)
+    return ''
+  })
+
+  // 3. Due time: "at Xpm" on a day keyword
   const atTimeRe = /\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/gi
   working = working.replace(atTimeRe, (match, timeStr) => {
     if (!dueDate) {
@@ -108,24 +136,26 @@ function parseNLMessage(text) {
     return ''
   })
 
-  // 3. Extract day keywords for due date
+  // 4. Day keyword → due date
   const dayBase = resolveDay(working)
   if (!dueDate && /(tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|next month)/i.test(working)) {
     dueDate = dayBase.toISOString()
   }
 
-  // 4. Clean up day/time words from title
+  // 5. Clean title — remove intent/time/day words
   working = working
+    .replace(/\b(?:so\s+)?(?:give\s+me\s+(?:a\s+)?(?:reminder|notification)|send\s+(?:me\s+)?notification|remind\s+me|notify\s+me).*$/gi, '')
     .replace(/\b(tomorrow|today|next week|next month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
-    .replace(/\bI have to\b/gi, '')
+    .replace(/\b(?:i\s+)?(?:have|need|want|gotta|got)\s+to\s+(?:buy\s+|get\s+|purchase\s+)?/gi, '')
+    .replace(/\b(?:so|also|please|as\s+well)\b/gi, '')
     .replace(/\s{2,}/g, ' ')
     .replace(/\s([.,!?])/g, '$1')
-    .replace(/^[.,\s]+|[.,\s]+$/g, '')
+    .replace(/^[.,\s/]+|[.,\s/]+$/g, '')
     .trim()
 
   const title = working || text.trim()
 
-  // 5. Intent
+  // 6. Intent
   let intent = 'task'
   if (EVENT_RE.test(text)) intent = 'event'
 
@@ -915,13 +945,23 @@ async function handleMessage(chatId, text, firstName) {
     }
 
     // Try splitting into multiple tasks first
-    const items = splitIntoItems(text)
+    const items = splitIntoItems(trimmed)
     if (items && items.length > 1) {
       const tasks = await Promise.all(
         items.map(item => taskService.createTask({ title: item, dueDate, tags: detectTags(item) }))
       )
+      // Create a reminder for each task if a notification time was mentioned
+      if (notifyAt) {
+        await Promise.all(tasks.map(t => reminderService.createReminder({
+          relatedEntityType: 'Task',
+          relatedEntityId: t.id,
+          scheduledAt: notifyAt,
+          chatId: String(chatId),
+          message: `🔔 *Reminder:* ${t.title}`,
+        })))
+      }
       let msg = `✅ *${tasks.length} Tasks Created!*\n━━━━━━━━━━━━━━━━━━━━\n\n${multiTaskList(tasks)}`
-      if (notifyAt) msg += `\n\n🔔 Notification scheduled for *${fmtDate(notifyAt)}*`
+      if (notifyAt) msg += `\n\n🔔 Reminder set for each task at *${fmtDate(notifyAt)}*`
       await send(chatId, msg, {
         reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
       }); return
