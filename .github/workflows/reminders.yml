@@ -1,0 +1,15 @@
+name: Fire Reminders
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping reminder endpoint
+        run: |
+          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            https://my-task-diary-and-event.vercel.app/api/cron/reminders \
+            && echo "OK" || echo "Failed (non-fatal)"

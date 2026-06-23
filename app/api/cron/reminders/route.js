@@ -14,8 +14,14 @@ async function sendTelegram(chatId, text) {
 }
 
 export async function GET(request) {
-  // Vercel calls this endpoint on the cron schedule.
-  // Find all PENDING reminders that are due (scheduledAt <= now) and have a chatId.
+  const secret = process.env.CRON_SECRET
+  if (secret) {
+    const auth = request.headers.get('Authorization')
+    if (auth !== `Bearer ${secret}`) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+  }
+
   const now = new Date()
 
   const due = await prisma.reminder.findMany({
