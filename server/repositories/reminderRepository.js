@@ -16,6 +16,13 @@ export async function updateReminder(id, data) {
   return prisma.reminder.update({ where: { id }, data })
 }
 
+export async function updateRemindersByTaskId(taskId, data) {
+  return prisma.reminder.updateMany({
+    where: { relatedEntityId: taskId, status: 'PENDING' },
+    data,
+  })
+}
+
 export async function deleteReminder(id) {
   return prisma.reminder.delete({ where: { id } })
 }

@@ -70,7 +70,12 @@ function parseTimeStr(timeStr, dayStr) {
   if (dayStr && /tomorrow/i.test(dayStr)) d++
 
   // h:min IST on that day → UTC = subtract 5h30m
-  return new Date(Date.UTC(y, mo, d, h, min, 0, 0) - IST_OFFSET_MS).toISOString()
+  const result = new Date(Date.UTC(y, mo, d, h, min, 0, 0) - IST_OFFSET_MS)
+  // No explicit day + time already passed → auto-advance to tomorrow
+  if (!dayStr && result.getTime() <= Date.now()) {
+    result.setUTCDate(result.getUTCDate() + 1)
+  }
+  return result.toISOString()
 }
 
 function resolveDay(text) {
@@ -203,7 +208,9 @@ function statusBadge(s) {
 }
 
 function taskCard(t, idx) {
-  const lines = [`*${idx}. ${t.title}*`, `${statusBadge(t.status)}   ${priorityLabel(t.priority ?? 0)}`]
+  const lines = [`*${idx}. ${t.title}*`]
+  if (t.description) lines.push(t.description)
+  lines.push(`${statusBadge(t.status)}   ${priorityLabel(t.priority ?? 0)}`)
   if (t.dueDate) lines.push(`📅 ${fmtDate(t.dueDate)}`)
   if (t.reminderDate) lines.push(`🔔 ${fmtDate(t.reminderDate)}`)
   if (t.category) lines.push(`📁 ${t.category}`)
@@ -287,10 +294,9 @@ function remindersMenuKB() {
   }
 }
 
-// Returns TWO rows: [status/edit/del] and [priority cycle]
+// Returns THREE rows per task: [status/edit/del], [priority], [edit time]
 function taskActionRows(t) {
   const isDone = t.status === 'COMPLETED' || t.status === 'DONE'
-  const nextPri = ((t.priority ?? 0) + 1) % 3
   const priLabel = ['🟢 Low', '🟡 Med', '🔴 High']
   return [
     [
@@ -302,6 +308,7 @@ function taskActionRows(t) {
     ],
     [
       { text: `⚡ Priority: ${priLabel[t.priority ?? 0]} →`, callback_data: `t_pri_${t.id}` },
+      { text: '⏰ Edit Time', callback_data: `t_edittime_${t.id}` },
     ],
   ]
 }
@@ -827,6 +834,14 @@ async function handleCallback(query) {
     const { text, kb } = await buildTaskPage(0, 'all')
     await edit(chatId, msgId, text, { reply_markup: kb }); return
   }
+  if (data.startsWith('t_edittime_')) {
+    const id = data.slice(11)
+    const task = await taskService.getTask(id)
+    await edit(chatId, msgId,
+      `⏰ *Edit Reminder & Due Time*\n\n*Task:* ${task?.title}\n\nSend the new time:\n\`/settime ${id} tomorrow 7pm\`\n\`/settime ${id} 25 Jun 9am\`\n\`/settime ${id} 7pm\`\n\n_If the time has already passed today, it auto-moves to tomorrow._`,
+      { reply_markup: { inline_keyboard: [[{ text: '✗ Cancel', callback_data: 'tasks_p_0' }]] } }
+    ); return
+  }
 
   // ── Event actions ──
   if (data.startsWith('e_edit_')) {
@@ -978,6 +993,28 @@ async function handleMessage(chatId, text, firstName) {
     await send(chatId, `🏷 Tag *"${tag}"* added!`); return
   }
 
+  if (cmd === '/settime') {
+    const spaceIdx = rest.indexOf(' ')
+    if (spaceIdx === -1) {
+      await send(chatId, `❌ Usage: \`/settime <task_id> <time>\`\nExample: \`/settime abc123 tomorrow 7pm\``); return
+    }
+    const id = rest.slice(0, spaceIdx).trim()
+    const timeText = rest.slice(spaceIdx + 1).trim()
+    const task = await taskService.getTask(id)
+    if (!task) { await send(chatId, `❌ Task not found: \`${id}\``); return }
+    const { dueDate, notifyAt } = parseNLMessage(timeText)
+    const newTime = dueDate || notifyAt
+    if (!newTime) {
+      await send(chatId, `❌ Couldn't understand the time.\nTry: \`tomorrow 7pm\`, \`25 Jun 9am\`, \`7pm\``); return
+    }
+    await taskService.updateTask(id, { dueDate: newTime, reminderDate: newTime })
+    await reminderService.rescheduleForTask(id, newTime)
+    await send(chatId,
+      `✅ *Time updated!*\n\n*${task.title}*\n📅 *${fmtDate(newTime)}*\n🔔 Reminder rescheduled too!`,
+      { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+    ); return
+  }
+
   // ── Natural language fallback ──
   if (!trimmed.startsWith('/')) {
     const { title, dueDate, notifyAt, intent } = parseNLMessage(trimmed)
@@ -990,27 +1027,28 @@ async function handleMessage(chatId, text, firstName) {
       ); return
     }
 
-    // Try splitting into multiple tasks first
+    // Multiple items → ONE task with bullet-list description
     const items = splitIntoItems(trimmed)
     if (items && items.length > 1) {
-      const tasks = await Promise.all(
-        items.map(item => taskService.createTask({ title: item, dueDate, tags: detectTags(item) }))
-      )
-      // Create a reminder for each task if a notification time was mentioned
+      const taskTitle = items.join(', ')
+      const description = items.map(i => `• ${i}`).join('\n')
+      const autoTags = detectTags(trimmed)
+      const t = await taskService.createTask({ title: taskTitle, description, dueDate, tags: autoTags })
+      let reminderNote = ''
       if (notifyAt) {
-        await Promise.all(tasks.map(t => reminderService.createReminder({
+        await reminderService.createReminder({
           relatedEntityType: 'Task',
           relatedEntityId: t.id,
           scheduledAt: notifyAt,
           chatId: String(chatId),
-          message: `🔔 *Reminder:* ${t.title}`,
-        })))
+          message: `🔔 *Reminder:* ${taskTitle}`,
+        })
+        reminderNote = `\n🔔 Reminder set for *${fmtDate(notifyAt)}*`
       }
-      let msg = `✅ *${tasks.length} Tasks Created!*\n━━━━━━━━━━━━━━━━━━━━\n\n${multiTaskList(tasks)}`
-      if (notifyAt) msg += `\n\n🔔 Reminder set for each task at *${fmtDate(notifyAt)}*`
-      await send(chatId, msg, {
-        reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
-      }); return
+      await send(chatId,
+        `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}${reminderNote}`,
+        { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+      ); return
     }
 
     // Single task with auto-detected tags from original message

@@ -26,3 +26,7 @@ export async function updateReminder(id, payload) {
 export async function deleteReminder(id) {
   return repo.deleteReminder(id)
 }
+
+export async function rescheduleForTask(taskId, scheduledAt) {
+  return repo.updateRemindersByTaskId(taskId, { scheduledAt: new Date(scheduledAt) })
+}
