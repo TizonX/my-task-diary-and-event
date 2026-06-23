@@ -243,6 +243,9 @@ function reminderCard(r, idx) {
 
 const MAIN_MENU_KB = {
   inline_keyboard: [
+    // Quick access — most-used shortcuts at the top
+    [{ text: '📋 All Tasks', callback_data: 'tasks_p_0' }, { text: '🔔 All Reminders', callback_data: 'reminders_p_0' }],
+    // Section menus
     [{ text: '📝 Tasks', callback_data: 'menu_tasks' }, { text: '📅 Events', callback_data: 'menu_events' }],
     [{ text: '🔔 Reminders', callback_data: 'menu_reminders' }, { text: '🏷 Tags', callback_data: 'menu_tags' }],
     [{ text: '⚡ Priorities', callback_data: 'menu_priorities' }, { text: '📊 Statistics', callback_data: 'menu_stats' }],
@@ -284,15 +287,28 @@ function remindersMenuKB() {
   }
 }
 
-function taskActionRow(t) {
+// Returns TWO rows: [status/edit/del] and [priority cycle]
+function taskActionRows(t) {
   const isDone = t.status === 'COMPLETED' || t.status === 'DONE'
+  const nextPri = ((t.priority ?? 0) + 1) % 3
+  const priLabel = ['🟢 Low', '🟡 Med', '🔴 High']
   return [
-    isDone
-      ? { text: '🔄 Reopen', callback_data: `t_reopen_${t.id}` }
-      : { text: '✅ Done', callback_data: `t_done_${t.id}` },
-    { text: '✏️ Edit', callback_data: `t_edit_${t.id}` },
-    { text: '🗑 Del', callback_data: `t_confirmDel_${t.id}` },
+    [
+      isDone
+        ? { text: '🔄 Reopen', callback_data: `t_reopen_${t.id}` }
+        : { text: '✅ Done', callback_data: `t_done_${t.id}` },
+      { text: '✏️ Edit', callback_data: `t_edit_${t.id}` },
+      { text: '🗑 Del', callback_data: `t_confirmDel_${t.id}` },
+    ],
+    [
+      { text: `⚡ Priority: ${priLabel[t.priority ?? 0]} →`, callback_data: `t_pri_${t.id}` },
+    ],
   ]
+}
+
+// Legacy single-row alias for search results
+function taskActionRow(t) {
+  return taskActionRows(t)[0]
 }
 
 function eventActionRow(e) {
@@ -415,7 +431,7 @@ async function buildTaskPage(page = 0, filter = 'all') {
 
   const prefixMap = { all: 'tasks_p', done: 'tasks_done', open: 'tasks_open', hi: 'tasks_hi' }
   const kb = { inline_keyboard: [] }
-  slice.forEach(t => kb.inline_keyboard.push(taskActionRow(t)))
+  slice.forEach(t => taskActionRows(t).forEach(row => kb.inline_keyboard.push(row)))
   if (tasks.length > PAGE_SIZE) kb.inline_keyboard.push(paginationRow(page, tasks.length, prefixMap[filter]))
   kb.inline_keyboard.push([{ text: '📝 Tasks Menu', callback_data: 'menu_tasks' }, { text: '🏠 Home', callback_data: 'menu_home' }])
   return { text, kb }
@@ -798,6 +814,16 @@ async function handleCallback(query) {
     const id = data.slice(6)
     await taskService.deleteTask(id)
     await toast(query.id, '🗑 Task deleted!')
+    const { text, kb } = await buildTaskPage(0, 'all')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+  if (data.startsWith('t_pri_')) {
+    const id = data.slice(6)
+    const task = await taskService.getTask(id)
+    const next = ((task?.priority ?? 0) + 1) % 3
+    const label = ['🟢 Low', '🟡 Medium', '🔴 High'][next]
+    await taskService.updateTask(id, { priority: next })
+    await toast(query.id, `⚡ Priority → ${label}`)
     const { text, kb } = await buildTaskPage(0, 'all')
     await edit(chatId, msgId, text, { reply_markup: kb }); return
   }
