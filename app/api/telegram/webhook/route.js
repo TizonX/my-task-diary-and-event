@@ -46,6 +46,14 @@ const EVENT_RE = /\b(meeting|call|standup|party|event|appointment|interview|lunc
 
 // ── Time helpers ──────────────────────────────────────────────────────────────
 
+// All user times assumed to be IST (UTC+5:30)
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000
+
+function istNow() {
+  // Returns a Date whose UTC fields represent the current IST date/time
+  return new Date(Date.now() + IST_OFFSET_MS)
+}
+
 function parseTimeStr(timeStr, dayStr) {
   if (!timeStr) return null
   const m = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i)
@@ -55,29 +63,31 @@ function parseTimeStr(timeStr, dayStr) {
   const ampm = (m[3] || '').toLowerCase()
   if (ampm === 'pm' && h < 12) h += 12
   if (ampm === 'am' && h === 12) h = 0
-  const now = new Date()
-  const d = new Date(now)
-  if (dayStr && /tomorrow/i.test(dayStr)) d.setDate(d.getDate() + 1)
-  d.setHours(h, min, 0, 0)
-  return d.toISOString()
+
+  // Build date in IST: get current IST date fields
+  const ist = istNow()
+  let y = ist.getUTCFullYear(), mo = ist.getUTCMonth(), d = ist.getUTCDate()
+  if (dayStr && /tomorrow/i.test(dayStr)) d++
+
+  // h:min IST on that day → UTC = subtract 5h30m
+  return new Date(Date.UTC(y, mo, d, h, min, 0, 0) - IST_OFFSET_MS).toISOString()
 }
 
 function resolveDay(text) {
-  const now = new Date()
-  if (/\btomorrow\b/i.test(text)) { const d = new Date(now); d.setDate(d.getDate() + 1); return d }
-  if (/\bnext week\b/i.test(text)) { const d = new Date(now); d.setDate(d.getDate() + 7); return d }
-  if (/\bnext month\b/i.test(text)) { const d = new Date(now); d.setMonth(d.getMonth() + 1); return d }
+  const ist = istNow()
+  const y = ist.getUTCFullYear(), mo = ist.getUTCMonth(), d = ist.getUTCDate()
+  if (/\btomorrow\b/i.test(text))   return new Date(Date.UTC(y, mo, d + 1) - IST_OFFSET_MS)
+  if (/\bnext week\b/i.test(text))  return new Date(Date.UTC(y, mo, d + 7) - IST_OFFSET_MS)
+  if (/\bnext month\b/i.test(text)) return new Date(Date.UTC(y, mo + 1, d) - IST_OFFSET_MS)
   const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday']
   for (let i = 0; i < days.length; i++) {
     if (new RegExp(`\\b${days[i]}\\b`, 'i').test(text)) {
-      const d = new Date(now)
-      let diff = i - d.getDay()
+      let diff = i - ist.getUTCDay()
       if (diff <= 0) diff += 7
-      d.setDate(d.getDate() + diff)
-      return d
+      return new Date(Date.UTC(y, mo, d + diff) - IST_OFFSET_MS)
     }
   }
-  return new Date(now) // today
+  return new Date(Date.UTC(y, mo, d) - IST_OFFSET_MS) // today midnight IST
 }
 
 const MONTH_MAP = {
@@ -90,14 +100,19 @@ function parseSpecificDateWithTime(dayStr, monthStr, timeStr) {
   const month = MONTH_MAP[monthStr.slice(0, 3).toLowerCase()]
   const day = parseInt(dayStr)
   if (month === undefined || !day || day > 31) return null
-  const now = new Date()
-  const d = new Date(now.getFullYear(), month, day)
-  if (d < now) d.setFullYear(d.getFullYear() + 1)
+  const ist = istNow()
+  let year = ist.getUTCFullYear()
+  // If target date already passed this year, use next year
+  if (new Date(Date.UTC(year, month, day)) < ist) year++
+  let h = 0, min = 0
   if (timeStr) {
     const t = parseTimeStr(timeStr, '')
-    if (t) { const b = new Date(t); d.setHours(b.getHours(), b.getMinutes(), 0, 0) }
+    if (t) {
+      const b = new Date(new Date(t).getTime() + IST_OFFSET_MS)
+      h = b.getUTCHours(); min = b.getUTCMinutes()
+    }
   }
-  return d.toISOString()
+  return new Date(Date.UTC(year, month, day, h, min, 0, 0) - IST_OFFSET_MS).toISOString()
 }
 
 // Main NLP parser — returns { title, dueDate, notifyAt, intent }
@@ -121,16 +136,21 @@ function parseNLMessage(text) {
     return ''
   })
 
-  // 3. Due time: "at Xpm" on a day keyword
+  // 3. Due time: "at Xpm" sets both dueDate and auto-schedules a reminder
   const atTimeRe = /\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/gi
   working = working.replace(atTimeRe, (match, timeStr) => {
     if (!dueDate) {
       const day = resolveDay(working)
-      const t = parseTimeStr(timeStr, '')
-      if (t) {
-        const base = new Date(t)
-        base.setFullYear(day.getFullYear(), day.getMonth(), day.getDate())
-        dueDate = base.toISOString()
+      const ist = istNow()
+      const y = day.getUTCFullYear ? day.getUTCFullYear() : ist.getUTCFullYear()
+      const mo = day.getUTCMonth ? day.getUTCMonth() : ist.getUTCMonth()
+      const d = day.getUTCDate ? day.getUTCDate() : ist.getUTCDate()
+      const tmpT = parseTimeStr(timeStr, '')
+      if (tmpT) {
+        const b = new Date(new Date(tmpT).getTime() + IST_OFFSET_MS)
+        dueDate = new Date(Date.UTC(y, mo, d, b.getUTCHours(), b.getUTCMinutes(), 0, 0) - IST_OFFSET_MS).toISOString()
+        // Auto-create reminder at the same time unless user already specified one
+        if (!notifyAt) notifyAt = dueDate
       }
     }
     return ''
