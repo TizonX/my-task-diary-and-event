@@ -1,0 +1,7 @@
+import { NextResponse } from 'next/server'
+import * as taskService from '../../../../../server/services/taskService'
+
+export async function POST(request, { params }) {
+  await taskService.completeTask(params.id)
+  return NextResponse.json({ ok: true })
+}
