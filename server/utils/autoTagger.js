@@ -204,3 +204,64 @@ export function detectTags(text) {
 
   return detected
 }
+
+// ── Item splitter ─────────────────────────────────────────────────────────────
+
+const BUY_VERB_RE = /^(?:buy|get|purchase|pick\s+up|grab|order|bring|fetch|need\s+(?:to\s+)?(?:buy\s+)?|have\s+(?:to\s+)?(?:buy\s+)?|want\s+(?:to\s+)?(?:buy\s+)?)\s*/i
+
+function cleanItem(s) {
+  return s.trim().replace(/^(?:a|an|the|some|few)\s+/i, '').trim()
+}
+
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+/**
+ * Returns an array of item strings if the message is a list, otherwise null.
+ * Handles:
+ *   "Buy milk, bread and maggie"  → ["Milk", "Bread", "Maggie"]
+ *   "milk bread maggie"           → ["Milk", "Bread", "Maggie"]
+ *   "Buy shoes and shirt"         → ["Shoes", "Shirt"]
+ *   "Buy groceries"               → null  (single item)
+ */
+export function splitIntoItems(text) {
+  let working = text.trim()
+
+  // Strip buy-type verb prefix
+  const hadVerb = BUY_VERB_RE.test(working)
+  if (hadVerb) working = working.replace(BUY_VERB_RE, '').trim()
+
+  // Strip trailing time/date phrases so they don't become items
+  working = working
+    .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?/gi, '')
+    .replace(/\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week)\b/gi, '')
+    .trim()
+
+  if (!working) return null
+
+  // 1. Comma-separated (most explicit)
+  if (working.includes(',')) {
+    const parts = working
+      .replace(/,\s*and\s+/gi, ',')
+      .split(/,+/)
+      .map(cleanItem)
+      .filter(s => s.length > 0)
+    if (parts.length >= 2) return parts.map(cap)
+  }
+
+  // 2. "and"-separated
+  const andParts = working
+    .split(/\s+and\s+/i)
+    .map(cleanItem)
+    .filter(s => s.length > 0)
+  if (andParts.length >= 2) return andParts.map(cap)
+
+  // 3. Space-separated after a buy verb — each word treated as an item
+  if (hadVerb) {
+    const words = working.split(/\s+/).filter(s => s.length > 1)
+    if (words.length >= 2) return words.map(cap)
+  }
+
+  return null
+}

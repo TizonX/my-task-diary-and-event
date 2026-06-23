@@ -6,7 +6,7 @@ import * as taskService from '../../../../server/services/taskService'
 import * as eventService from '../../../../server/services/eventService'
 import * as reminderService from '../../../../server/services/reminderService'
 import logger from '../../../../server/logger'
-import { detectTags } from '../../../../server/utils/autoTagger'
+import { detectTags, splitIntoItems } from '../../../../server/utils/autoTagger'
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const BASE_URL = process.env.BASE_URL || 'https://my-task-diary-and-event.vercel.app'
@@ -160,6 +160,14 @@ function taskCard(t, idx) {
   if (t.tags?.length) lines.push(`🏷 ${t.tags.join(' · ')}`)
   lines.push(`🆔 \`${t.id}\``)
   return lines.join('\n')
+}
+
+function multiTaskList(tasks) {
+  const lines = tasks.map((t, i) => {
+    const tags = t.tags?.length ? `  🏷 ${t.tags.join(' · ')}` : ''
+    return `*${i + 1}.* ${t.title}${tags}\n    🆔 \`${t.id}\``
+  })
+  return lines.join('\n\n')
 }
 
 function eventCard(e, idx) {
@@ -813,6 +821,16 @@ async function handleMessage(chatId, text, firstName) {
 
   if (cmd === '/add') {
     if (!rest) { await send(chatId, `❌ Usage: \`/add <title>\``); return }
+    const items = splitIntoItems(rest)
+    if (items && items.length > 1) {
+      const tasks = await Promise.all(
+        items.map(item => taskService.createTask({ title: item, tags: detectTags(item) }))
+      )
+      await send(chatId,
+        `✅ *${tasks.length} Tasks Created!*\n━━━━━━━━━━━━━━━━━━━━\n\n${multiTaskList(tasks)}`,
+        { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+      ); return
+    }
     const autoTags = detectTags(rest)
     const t = await taskService.createTask({ title: rest, tags: autoTags })
     await send(chatId, `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`, {
@@ -896,7 +914,20 @@ async function handleMessage(chatId, text, firstName) {
       ); return
     }
 
-    // Create task with auto-detected tags from original message
+    // Try splitting into multiple tasks first
+    const items = splitIntoItems(text)
+    if (items && items.length > 1) {
+      const tasks = await Promise.all(
+        items.map(item => taskService.createTask({ title: item, dueDate, tags: detectTags(item) }))
+      )
+      let msg = `✅ *${tasks.length} Tasks Created!*\n━━━━━━━━━━━━━━━━━━━━\n\n${multiTaskList(tasks)}`
+      if (notifyAt) msg += `\n\n🔔 Notification scheduled for *${fmtDate(notifyAt)}*`
+      await send(chatId, msg, {
+        reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
+      }); return
+    }
+
+    // Single task with auto-detected tags from original message
     const autoTags = detectTags(text)
     const t = await taskService.createTask({ title, dueDate, tags: autoTags })
 
