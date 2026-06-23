@@ -4,366 +4,765 @@ import { NextResponse } from 'next/server'
 import { upsertTelegramUser } from '../../../../server/repositories/telegramUserRepository'
 import * as taskService from '../../../../server/services/taskService'
 import * as eventService from '../../../../server/services/eventService'
+import * as reminderService from '../../../../server/services/reminderService'
 import logger from '../../../../server/logger'
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
+const BASE_URL = process.env.BASE_URL || 'https://my-task-diary-and-event.vercel.app'
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`
+const PAGE_SIZE = 3
 
-// ── Telegram helpers ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function sendMessage(chatId, text, extra = {}) {
-  await fetch(`${API}/sendMessage`, {
+async function tg(method, body) {
+  await fetch(`${API}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', ...extra }),
+    body: JSON.stringify(body),
   })
 }
 
-async function editMessage(chatId, messageId, text, extra = {}) {
-  await fetch(`${API}/editMessageText`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', ...extra }),
-  })
+const send = (chat_id, text, extra = {}) =>
+  tg('sendMessage', { chat_id, text, parse_mode: 'Markdown', ...extra })
+
+const edit = (chat_id, message_id, text, extra = {}) =>
+  tg('editMessageText', { chat_id, message_id, text, parse_mode: 'Markdown', ...extra })
+
+const answer = (callback_query_id, text = '') =>
+  tg('answerCallbackQuery', { callback_query_id, text })
+
+const toast = (callback_query_id, text) =>
+  tg('answerCallbackQuery', { callback_query_id, text, show_alert: false })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NLP — intent detection & date extraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REMINDER_RE = /\b(remind|reminder|every|weekly|daily|monthly|each|recurring|repeat)\b/i
+const EVENT_RE = /\b(meeting|call|standup|party|event|appointment|interview|lunch|dinner|breakfast|session|seminar|conference|hangout|outing|trip)\b/i
+const DATE_RE = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|next month|\d{1,2}\s*(am|pm)|\d{1,2}:\d{2})\b/i
+
+function detectIntent(text) {
+  if (REMINDER_RE.test(text)) return 'reminder'
+  if (EVENT_RE.test(text)) return 'event'
+  return 'task'
 }
 
-async function answerCallback(id, text = '') {
-  await fetch(`${API}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: id, text }),
-  })
+function extractTime(text) {
+  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i)
+  if (!m) return null
+  let h = parseInt(m[1])
+  const min = parseInt(m[2] || '0')
+  if (/pm/i.test(m[3]) && h < 12) h += 12
+  if (/am/i.test(m[3]) && h === 12) h = 0
+  return { h, min }
 }
 
-// ── Formatters ────────────────────────────────────────────────────────────────
+function extractDate(text) {
+  const now = new Date()
+  const time = extractTime(text)
+  function applyTime(d) {
+    if (time) d.setHours(time.h, time.min, 0, 0)
+    return d
+  }
+  if (/\btoday\b/i.test(text)) return applyTime(new Date(now)).toISOString()
+  if (/\btomorrow\b/i.test(text)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1); return applyTime(d).toISOString()
+  }
+  if (/\bnext week\b/i.test(text)) {
+    const d = new Date(now); d.setDate(d.getDate() + 7); return applyTime(d).toISOString()
+  }
+  if (/\bnext month\b/i.test(text)) {
+    const d = new Date(now); d.setMonth(d.getMonth() + 1); return applyTime(d).toISOString()
+  }
+  const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday']
+  for (let i = 0; i < days.length; i++) {
+    if (new RegExp(`\\b${days[i]}\\b`, 'i').test(text)) {
+      const d = new Date(now)
+      let diff = i - d.getDay()
+      if (diff <= 0) diff += 7
+      d.setDate(d.getDate() + diff)
+      return applyTime(d).toISOString()
+    }
+  }
+  if (time) { const d = new Date(now); return applyTime(d).toISOString() }
+  return null
+}
 
-function formatDate(iso) {
+function cleanTitle(text) {
+  return text
+    .replace(/\b(remind me (to|about)?|every\s+\w+|tomorrow|today|next week|next month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, '')
+    .replace(/\b\d{1,2}(:\d{2})?\s*(am|pm)\b/gi, '')
+    .replace(/\s+/g, ' ').trim()
+    || text.trim()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Formatters
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fmtDate(iso) {
   if (!iso) return '—'
   return new Date(iso).toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: true,
+    timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short',
+    year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true,
   })
 }
 
 function priorityLabel(p) {
-  if (p === 2) return '🔴 High'
-  if (p === 1) return '🟡 Medium'
-  return '🟢 Low'
+  return p === 2 ? '🔴 High' : p === 1 ? '🟡 Medium' : '🟢 Low'
 }
 
-function statusEmoji(s) {
-  return s === 'COMPLETED' || s === 'DONE' ? '✅' : '🔵'
+function statusBadge(s) {
+  return s === 'COMPLETED' || s === 'DONE' ? '✅ Done' : '🔵 Open'
 }
 
-function formatTaskCard(t, index) {
-  const lines = [
-    `*${index}. ${t.title}*`,
-    `${statusEmoji(t.status)} ${t.status === 'COMPLETED' || t.status === 'DONE' ? 'Completed' : 'Open'}  ${priorityLabel(t.priority ?? 0)}`,
-  ]
-  if (t.dueDate) lines.push(`📅 Due: ${formatDate(t.dueDate)}`)
-  if (t.reminderDate) lines.push(`🔔 Reminder: ${formatDate(t.reminderDate)}`)
+function taskCard(t, idx) {
+  const lines = [`*${idx}. ${t.title}*`, `${statusBadge(t.status)}   ${priorityLabel(t.priority ?? 0)}`]
+  if (t.dueDate) lines.push(`📅 ${fmtDate(t.dueDate)}`)
+  if (t.reminderDate) lines.push(`🔔 ${fmtDate(t.reminderDate)}`)
   if (t.category) lines.push(`📁 ${t.category}`)
-  if (t.tags?.length) lines.push(`🏷️ ${t.tags.join('  •  ')}`)
+  if (t.tags?.length) lines.push(`🏷 ${t.tags.join(' · ')}`)
   lines.push(`🆔 \`${t.id}\``)
   return lines.join('\n')
 }
 
-function taskActionButtons(task) {
-  const id = task.id
-  const isDone = task.status === 'COMPLETED' || task.status === 'DONE'
+function eventCard(e, idx) {
+  const lines = [`*${idx}. ${e.title}*`, `📅 ${fmtDate(e.startDate)}`]
+  if (e.endDate) lines.push(`🏁 Ends: ${fmtDate(e.endDate)}`)
+  if (e.tags?.length) lines.push(`🏷 ${e.tags.join(' · ')}`)
+  lines.push(`🆔 \`${e.id}\``)
+  return lines.join('\n')
+}
+
+function reminderCard(r, idx) {
+  return [
+    `*${idx}. ${r.relatedEntityType} reminder*`,
+    `🔔 ${fmtDate(r.scheduledAt)}`,
+    `📌 ${r.status}`,
+    `🆔 \`${r.id}\``,
+  ].join('\n')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Keyboards
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAIN_MENU_KB = {
+  inline_keyboard: [
+    [{ text: '📝 Tasks', callback_data: 'menu_tasks' }, { text: '📅 Events', callback_data: 'menu_events' }],
+    [{ text: '🔔 Reminders', callback_data: 'menu_reminders' }, { text: '🏷 Tags', callback_data: 'menu_tags' }],
+    [{ text: '⚡ Priorities', callback_data: 'menu_priorities' }, { text: '📊 Statistics', callback_data: 'menu_stats' }],
+    [{ text: '📚 Developer Center', callback_data: 'menu_dev' }, { text: '❓ Help', callback_data: 'menu_help' }],
+  ],
+}
+
+const BACK_HOME = [[{ text: '🏠 Main Menu', callback_data: 'menu_home' }]]
+
+function tasksMenuKB() {
+  return {
+    inline_keyboard: [
+      [{ text: '➕ Add Task', callback_data: 'task_add' }, { text: '📋 All Tasks', callback_data: 'tasks_p_0' }],
+      [{ text: '✅ Completed', callback_data: 'tasks_done_0' }, { text: '🔍 Search', callback_data: 'task_search' }],
+      [{ text: '⚡ High Priority', callback_data: 'tasks_hi_0' }, { text: '🏷 By Tag', callback_data: 'task_bytag' }],
+      ...BACK_HOME,
+    ],
+  }
+}
+
+function eventsMenuKB() {
+  return {
+    inline_keyboard: [
+      [{ text: '➕ Add Event', callback_data: 'event_add' }, { text: '📋 All Events', callback_data: 'events_p_0' }],
+      [{ text: '🗑 Delete Event', callback_data: 'event_del_prompt' }],
+      ...BACK_HOME,
+    ],
+  }
+}
+
+function remindersMenuKB() {
+  return {
+    inline_keyboard: [
+      [{ text: '📋 All Reminders', callback_data: 'reminders_p_0' }],
+      [{ text: '🗑 Delete Reminder', callback_data: 'reminder_del_prompt' }],
+      ...BACK_HOME,
+    ],
+  }
+}
+
+function taskActionRow(t) {
+  const isDone = t.status === 'COMPLETED' || t.status === 'DONE'
   return [
     isDone
-      ? { text: '🔄 Reopen', callback_data: `task_reopen_${id}` }
-      : { text: '✅ Complete', callback_data: `task_done_${id}` },
-    { text: '✏️ Edit Title', callback_data: `task_edit_${id}` },
-    { text: '🗑️ Delete', callback_data: `task_del_${id}` },
+      ? { text: '🔄 Reopen', callback_data: `t_reopen_${t.id}` }
+      : { text: '✅ Done', callback_data: `t_done_${t.id}` },
+    { text: '✏️ Edit', callback_data: `t_edit_${t.id}` },
+    { text: '🗑 Del', callback_data: `t_confirmDel_${t.id}` },
   ]
 }
 
-// ── Keyboards ─────────────────────────────────────────────────────────────────
+function eventActionRow(e) {
+  return [
+    { text: '✏️ Edit', callback_data: `e_edit_${e.id}` },
+    { text: '🗑 Del', callback_data: `e_confirmDel_${e.id}` },
+  ]
+}
 
-const MAIN_MENU = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: '📝 Add Task', callback_data: 'menu_add_task' }, { text: '📋 My Tasks', callback_data: 'menu_list_tasks' }],
-      [{ text: '📅 Add Event', callback_data: 'menu_add_event' }, { text: '🔍 Search Tasks', callback_data: 'menu_search' }],
-      [{ text: '❓ How to use', callback_data: 'menu_help' }],
+function paginationRow(page, total, prefix) {
+  const last = Math.ceil(total / PAGE_SIZE) - 1
+  const row = []
+  if (page > 0) row.push({ text: '◀ Prev', callback_data: `${prefix}_${page - 1}` })
+  row.push({ text: `${page + 1}/${last + 1}`, callback_data: 'noop' })
+  if (page < last) row.push({ text: 'Next ▶', callback_data: `${prefix}_${page + 1}` })
+  return row
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page builders
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function buildTaskPage(page = 0, filter = 'all') {
+  const all = await taskService.listTasks({})
+  let tasks = all
+  if (filter === 'done') tasks = all.filter(t => t.status === 'COMPLETED' || t.status === 'DONE')
+  else if (filter === 'open') tasks = all.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE')
+  else if (filter === 'hi') tasks = all.filter(t => (t.priority ?? 0) === 2)
+
+  if (!tasks.length) return {
+    text: '📭 *No tasks found.*\n\nTap ➕ Add Task to create one.',
+    kb: { inline_keyboard: [[{ text: '➕ Add Task', callback_data: 'task_add' }], ...BACK_HOME] },
+  }
+
+  const slice = tasks.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const filterLabel = { all: 'All', done: 'Completed', open: 'Open', hi: 'High Priority' }[filter]
+  let text = `📋 *Tasks — ${filterLabel}* (${tasks.length} total)\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  text += slice.map((t, i) => taskCard(t, page * PAGE_SIZE + i + 1)).join('\n\n')
+
+  const prefixMap = { all: 'tasks_p', done: 'tasks_done', open: 'tasks_open', hi: 'tasks_hi' }
+  const kb = { inline_keyboard: [] }
+  slice.forEach(t => kb.inline_keyboard.push(taskActionRow(t)))
+  if (tasks.length > PAGE_SIZE) kb.inline_keyboard.push(paginationRow(page, tasks.length, prefixMap[filter]))
+  kb.inline_keyboard.push([{ text: '📝 Tasks Menu', callback_data: 'menu_tasks' }, { text: '🏠 Home', callback_data: 'menu_home' }])
+  return { text, kb }
+}
+
+async function buildEventPage(page = 0) {
+  const events = await eventService.listEvents({})
+  if (!events.length) return {
+    text: '📭 *No events found.*\n\nTap ➕ Add Event to create one.',
+    kb: { inline_keyboard: [[{ text: '➕ Add Event', callback_data: 'event_add' }], ...BACK_HOME] },
+  }
+  const slice = events.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  let text = `📅 *Events* (${events.length} total)\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  text += slice.map((e, i) => eventCard(e, page * PAGE_SIZE + i + 1)).join('\n\n')
+  const kb = { inline_keyboard: [] }
+  slice.forEach(e => kb.inline_keyboard.push(eventActionRow(e)))
+  if (events.length > PAGE_SIZE) kb.inline_keyboard.push(paginationRow(page, events.length, 'events_p'))
+  kb.inline_keyboard.push([{ text: '📅 Events Menu', callback_data: 'menu_events' }, { text: '🏠 Home', callback_data: 'menu_home' }])
+  return { text, kb }
+}
+
+async function buildReminderPage(page = 0) {
+  const reminders = await reminderService.listReminders({})
+  if (!reminders.length) return {
+    text: '📭 *No reminders set.*',
+    kb: { inline_keyboard: BACK_HOME },
+  }
+  const slice = reminders.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  let text = `🔔 *Reminders* (${reminders.length} total)\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  text += slice.map((r, i) => reminderCard(r, page * PAGE_SIZE + i + 1)).join('\n\n')
+  const kb = { inline_keyboard: [] }
+  slice.forEach(r => kb.inline_keyboard.push([{ text: `🗑 Delete`, callback_data: `r_confirmDel_${r.id}` }]))
+  if (reminders.length > PAGE_SIZE) kb.inline_keyboard.push(paginationRow(page, reminders.length, 'reminders_p'))
+  kb.inline_keyboard.push(BACK_HOME[0])
+  return { text, kb }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main menu
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function showMainMenu(chatId, firstName, messageId = null) {
+  const text = `🏠 *My Task Diary & Event*\n\nHey ${firstName || 'there'}! What would you like to do?\n\n_You can also just type naturally:_\n_"Buy milk tomorrow" or "Meeting Friday 4pm"_`
+  const extra = { reply_markup: { inline_keyboard: MAIN_MENU_KB.inline_keyboard } }
+  if (messageId) await edit(chatId, messageId, text, extra)
+  else await send(chatId, text, extra)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Developer Center
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEV_CATEGORIES = [
+  {
+    name: '📝 Tasks API',
+    cb: 'dev_tasks',
+    endpoints: [
+      { method: 'GET', path: '/api/tasks', desc: 'List all tasks' },
+      { method: 'POST', path: '/api/tasks', desc: 'Create a task', body: '{ title, dueDate, priority, tags }' },
+      { method: 'GET', path: '/api/tasks/:id', desc: 'Get task by ID' },
+      { method: 'PATCH', path: '/api/tasks/:id', desc: 'Update task fields' },
+      { method: 'DELETE', path: '/api/tasks/:id', desc: 'Delete a task' },
+      { method: 'POST', path: '/api/tasks/:id/complete', desc: 'Mark as completed' },
+      { method: 'POST', path: '/api/tasks/:id/reopen', desc: 'Reopen a task' },
+      { method: 'POST', path: '/api/tasks/:id/tags', desc: 'Add tag', body: '{ tag }' },
+      { method: 'DELETE', path: '/api/tasks/:id/tags/:tag', desc: 'Remove tag' },
     ],
   },
-}
+  {
+    name: '📅 Events API',
+    cb: 'dev_events',
+    endpoints: [
+      { method: 'GET', path: '/api/events', desc: 'List all events' },
+      { method: 'POST', path: '/api/events', desc: 'Create an event', body: '{ title, startDate, endDate, tags }' },
+      { method: 'GET', path: '/api/events/:id', desc: 'Get event by ID' },
+      { method: 'PATCH', path: '/api/events/:id', desc: 'Update event' },
+      { method: 'DELETE', path: '/api/events/:id', desc: 'Delete event' },
+    ],
+  },
+  {
+    name: '🔔 Reminders API',
+    cb: 'dev_reminders',
+    endpoints: [
+      { method: 'GET', path: '/api/reminders', desc: 'List all reminders' },
+      { method: 'POST', path: '/api/reminders', desc: 'Create reminder', body: '{ relatedEntityType, relatedEntityId, scheduledAt }' },
+      { method: 'DELETE', path: '/api/reminders/:id', desc: 'Delete reminder' },
+    ],
+  },
+  {
+    name: '📣 Notifications API',
+    cb: 'dev_notifications',
+    endpoints: [
+      { method: 'POST', path: '/api/notifications/send', desc: 'Send to a user', body: '{ telegramId, message }' },
+      { method: 'POST', path: '/api/notifications/broadcast', desc: 'Broadcast to all users', body: '{ message }' },
+    ],
+  },
+]
 
-const BACK = [[{ text: '⬅️ Back to Menu', callback_data: 'menu_main' }]]
-
-// ── Task list builder ─────────────────────────────────────────────────────────
-
-async function buildTaskListMessage() {
-  const tasks = await taskService.listTasks({})
-  if (!tasks.length) {
-    return {
-      text: '📭 *No tasks yet.*\n\nTap *Add Task* to create your first one!',
-      keyboard: BACK,
-    }
-  }
-
-  const open = tasks.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE')
-  const done = tasks.filter(t => t.status === 'COMPLETED' || t.status === 'DONE')
-
-  let text = `📋 *Your Tasks* — ${open.length} open, ${done.length} done\n`
-  text += `━━━━━━━━━━━━━━━━━━━━\n\n`
-
-  const keyboard = []
-
-  let index = 1
-  if (open.length) {
-    text += `🔵 *Open Tasks*\n\n`
-    for (const t of open) {
-      text += formatTaskCard(t, index++) + '\n\n'
-      keyboard.push(taskActionButtons(t))
-    }
-  }
-
-  if (done.length) {
-    text += `✅ *Completed Tasks*\n\n`
-    for (const t of done) {
-      text += formatTaskCard(t, index++) + '\n\n'
-      keyboard.push(taskActionButtons(t))
-    }
-  }
-
-  keyboard.push(BACK[0])
-  return { text: text.trim(), keyboard }
-}
-
-// ── Greeting ──────────────────────────────────────────────────────────────────
-
-const GREETINGS = ['hi', 'hello', 'hey', 'hii', 'helo', 'howdy', 'yo', 'sup']
-
-function isGreeting(text) {
-  return GREETINGS.includes(text.trim().toLowerCase().replace(/[!.?,]/g, ''))
-}
-
-// ── Show main menu ────────────────────────────────────────────────────────────
-
-async function showMainMenu(chatId, firstName) {
-  await sendMessage(
-    chatId,
-    `👋 Hey ${firstName || 'there'}! Welcome to *My Task Diary & Event*.\n\nI help you manage tasks and events right from Telegram. Choose an option below:`,
-    MAIN_MENU,
+function devCenterMenu(chatId, messageId) {
+  return edit(chatId, messageId,
+    `📚 *Developer Center*\n━━━━━━━━━━━━━━━━━━━━\n\nBase URL:\n\`${BASE_URL}\`\n\nOpenAPI Spec:\n\`${BASE_URL}/api/openapi\`\n\nChatGPT Action URL:\n\`${BASE_URL}/api/openapi\`\n\nSelect a category to explore:`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          ...DEV_CATEGORIES.map(c => [{ text: c.name, callback_data: c.cb }]),
+          [{ text: '🌐 Open Dev Portal', url: `${BASE_URL}/dev` }],
+          ...BACK_HOME,
+        ],
+      },
+    },
   )
 }
 
-// ── Callback handler ──────────────────────────────────────────────────────────
+function devCategoryPage(chatId, messageId, cb) {
+  const cat = DEV_CATEGORIES.find(c => c.cb === cb)
+  if (!cat) return
+  const methodEmoji = { GET: '🟢', POST: '🔵', PATCH: '🟡', DELETE: '🔴' }
+  let text = `${cat.name}\n━━━━━━━━━━━━━━━━━━━━\n\n`
+  cat.endpoints.forEach(ep => {
+    text += `${methodEmoji[ep.method] || '⚪'} \`${ep.method}\` \`${ep.path}\`\n`
+    text += `   ${ep.desc}\n`
+    if (ep.body) text += `   Body: \`${ep.body}\`\n`
+    text += '\n'
+  })
+  return edit(chatId, messageId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🌐 Open Full Docs', url: `${BASE_URL}/dev` }],
+        [{ text: '◀ Back to Dev Center', callback_data: 'menu_dev' }],
+        ...BACK_HOME,
+      ],
+    },
+  })
+}
 
-async function handleCallbackQuery(query) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Callback handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleCallback(query) {
   const chatId = query.message.chat.id
-  const messageId = query.message.message_id
+  const msgId = query.message.message_id
   const data = query.data
   const firstName = query.from?.first_name || 'there'
 
-  await answerCallback(query.id)
+  await answer(query.id)
+
+  // ── noop ──
+  if (data === 'noop') return
 
   // ── Main menu ──
-  if (data === 'menu_main') {
-    await editMessage(
-      chatId, messageId,
-      `👋 Hey ${firstName}! Choose an option below:`,
-      MAIN_MENU,
-    )
-    return
+  if (data === 'menu_home') { await showMainMenu(chatId, firstName, msgId); return }
+
+  // ── Section menus ──
+  if (data === 'menu_tasks') {
+    await edit(chatId, msgId, `📝 *Tasks*\n\nWhat would you like to do?`, { reply_markup: tasksMenuKB() }); return
+  }
+  if (data === 'menu_events') {
+    await edit(chatId, msgId, `📅 *Events*\n\nWhat would you like to do?`, { reply_markup: eventsMenuKB() }); return
+  }
+  if (data === 'menu_reminders') {
+    await edit(chatId, msgId, `🔔 *Reminders*\n\nWhat would you like to do?`, { reply_markup: remindersMenuKB() }); return
   }
 
-  // ── Help ──
-  if (data === 'menu_help') {
-    await editMessage(chatId, messageId,
-      `❓ *How to use this bot*\n\n` +
-      `*Create a task:*\n\`/add Buy groceries\`\n\n` +
-      `*Create with due date:*\n\`/add Meeting at 5pm\`\n\n` +
-      `*Mark done:* tap ✅ Complete in My Tasks\n\n` +
-      `*Edit title:* tap ✏️ Edit Title — bot will prompt you\n\n` +
-      `*Delete:* tap 🗑️ Delete in My Tasks\n\n` +
-      `*Search:*\n\`/search groceries\`\n\n` +
-      `*Add event:*\n\`/event Team meeting tomorrow\`\n\n` +
-      `💡 *Tip:* Task IDs shown in \`code\` blocks — tap to copy!`,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
+  // ── Tags ──
+  if (data === 'menu_tags') {
+    const tasks = await taskService.listTasks({})
+    const allTags = [...new Set(tasks.flatMap(t => t.tags || []))]
+    const text = allTags.length
+      ? `🏷 *All Tags*\n━━━━━━━━━━━━━━━━━━━━\n\n${allTags.map(t => `• \`${t}\``).join('\n')}\n\n_Use_ \`/tag <task-id> <tag>\` _to add a tag._`
+      : `🏷 *No tags yet.*\n\nUse \`/tag <task-id> <tag>\` to add one.`
+    await edit(chatId, msgId, text, { reply_markup: { inline_keyboard: BACK_HOME } }); return
   }
 
-  // ── Add task prompt ──
-  if (data === 'menu_add_task') {
-    await editMessage(chatId, messageId,
-      `📝 *Add a Task*\n\nType your task and send it:\n\n\`/add <your task title>\`\n\n*Examples:*\n• \`/add Buy groceries\`\n• \`/add Call doctor at 3pm\`\n• \`/add Submit report by Friday\``,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
-  }
-
-  // ── Add event prompt ──
-  if (data === 'menu_add_event') {
-    await editMessage(chatId, messageId,
-      `📅 *Add an Event*\n\nType and send:\n\n\`/event <event title>\`\n\n*Examples:*\n• \`/event Team standup tomorrow 10am\`\n• \`/event Birthday party Saturday\``,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
-  }
-
-  // ── List tasks ──
-  if (data === 'menu_list_tasks' || data === 'tasks_refresh') {
-    const { text, keyboard } = await buildTaskListMessage()
-    await editMessage(chatId, messageId, text, { reply_markup: { inline_keyboard: keyboard } })
-    return
-  }
-
-  // ── Search prompt ──
-  if (data === 'menu_search') {
-    await editMessage(chatId, messageId,
-      `🔍 *Search Tasks*\n\nSend a keyword:\n\`/search <word>\`\n\nExample: \`/search groceries\``,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
-  }
-
-  // ── Task actions ──
-  if (data.startsWith('task_done_')) {
-    const id = data.replace('task_done_', '')
-    await taskService.completeTask(id)
-    const { text, keyboard } = await buildTaskListMessage()
-    await editMessage(chatId, messageId, text, { reply_markup: { inline_keyboard: keyboard } })
-    return
-  }
-
-  if (data.startsWith('task_reopen_')) {
-    const id = data.replace('task_reopen_', '')
-    await taskService.reopenTask(id)
-    const { text, keyboard } = await buildTaskListMessage()
-    await editMessage(chatId, messageId, text, { reply_markup: { inline_keyboard: keyboard } })
-    return
-  }
-
-  if (data.startsWith('task_del_')) {
-    const id = data.replace('task_del_', '')
-    await taskService.deleteTask(id)
-    const { text, keyboard } = await buildTaskListMessage()
-    await editMessage(chatId, messageId, `🗑️ Task deleted.\n\n` + text, { reply_markup: { inline_keyboard: keyboard } })
-    return
-  }
-
-  if (data.startsWith('task_edit_')) {
-    const id = data.replace('task_edit_', '')
-    const task = await taskService.getTask(id)
-    await editMessage(chatId, messageId,
-      `✏️ *Edit Task*\n\nCurrent title:\n*${task?.title || 'Unknown'}*\n\nSend the new title using:\n\`/update ${id} <new title>\`\n\n*Example:*\n\`/update ${id} Buy groceries and milk\``,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
-  }
-}
-
-// ── Command handler ───────────────────────────────────────────────────────────
-
-async function handleCommand(chatId, text, firstName) {
-  const parts = text.trim().split(' ')
-  const cmd = parts[0].toLowerCase()
-  const rest = parts.slice(1).join(' ')
-
-  if (cmd === '/start' || cmd === '/help' || isGreeting(text)) {
-    await showMainMenu(chatId, firstName)
-    return
-  }
-
-  if (cmd === '/add') {
-    if (!rest) {
-      await sendMessage(chatId, `❌ Please include a title.\n*Example:* \`/add Buy groceries\``)
-      return
-    }
-    const t = await taskService.createTask({ title: rest })
-    await sendMessage(chatId,
-      `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n📝 *${t.title}*\n🔵 Open  🟢 Low priority\n🆔 \`${t.id}\``,
+  // ── Priorities ──
+  if (data === 'menu_priorities') {
+    const tasks = await taskService.listTasks({})
+    const hi = tasks.filter(t => t.priority === 2).length
+    const mid = tasks.filter(t => t.priority === 1).length
+    const lo = tasks.filter(t => (t.priority ?? 0) === 0).length
+    await edit(chatId, msgId,
+      `⚡ *Priority Overview*\n━━━━━━━━━━━━━━━━━━━━\n\n🔴 High Priority: *${hi}* tasks\n🟡 Medium Priority: *${mid}* tasks\n🟢 Low Priority: *${lo}* tasks`,
       {
         reply_markup: {
           inline_keyboard: [
-            [{ text: '📋 View All Tasks', callback_data: 'menu_list_tasks' }, { text: '➕ Add Another', callback_data: 'menu_add_task' }],
-            [{ text: '🏠 Main Menu', callback_data: 'menu_main' }],
+            [{ text: '🔴 View High Priority', callback_data: 'tasks_hi_0' }],
+            ...BACK_HOME,
           ],
         },
-      },
-    )
-    return
+      }
+    ); return
+  }
+
+  // ── Statistics ──
+  if (data === 'menu_stats') {
+    const [tasks, events, reminders] = await Promise.all([
+      taskService.listTasks({}),
+      eventService.listEvents({}),
+      reminderService.listReminders({}),
+    ])
+    const open = tasks.filter(t => t.status !== 'COMPLETED' && t.status !== 'DONE').length
+    const done = tasks.length - open
+    const hi = tasks.filter(t => t.priority === 2).length
+    const mid = tasks.filter(t => t.priority === 1).length
+    const lo = tasks.filter(t => (t.priority ?? 0) === 0).length
+    const pct = tasks.length ? Math.round((done / tasks.length) * 100) : 0
+    const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10))
+    await edit(chatId, msgId,
+      `📊 *Statistics*\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `📝 *Tasks*\n` +
+      `Total: *${tasks.length}*  ·  Open: *${open}*  ·  Done: *${done}*\n` +
+      `Progress: \`${bar}\` ${pct}%\n\n` +
+      `⚡ *By Priority*\n🔴 High: ${hi}  🟡 Medium: ${mid}  🟢 Low: ${lo}\n\n` +
+      `📅 *Events:* ${events.length}\n` +
+      `🔔 *Reminders:* ${reminders.length}`,
+      { reply_markup: { inline_keyboard: BACK_HOME } },
+    ); return
+  }
+
+  // ── Developer Center ──
+  if (data === 'menu_dev') { await devCenterMenu(chatId, msgId); return }
+  if (DEV_CATEGORIES.some(c => c.cb === data)) { await devCategoryPage(chatId, msgId, data); return }
+
+  // ── Help ──
+  if (data === 'menu_help') {
+    await edit(chatId, msgId,
+      `❓ *How to use*\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `*🗣 Just type naturally:*\n` +
+      `_"Buy milk tomorrow"_ → creates task\n` +
+      `_"Meeting Friday 4pm"_ → creates event\n` +
+      `_"Remind me every Monday"_ → reminder\n\n` +
+      `*📝 Task commands:*\n` +
+      `\`/add <title>\` — create task\n` +
+      `\`/update <id> <title>\` — edit task\n` +
+      `\`/done <id>\` — complete task\n` +
+      `\`/delete <id>\` — delete task\n` +
+      `\`/tasks\` — list tasks\n` +
+      `\`/search <word>\` — search\n\n` +
+      `*📅 Event commands:*\n` +
+      `\`/event <title>\` — create event\n\n` +
+      `💡 *Tip:* Task IDs in \`code\` blocks — tap to copy!`,
+      { reply_markup: { inline_keyboard: BACK_HOME } },
+    ); return
+  }
+
+  // ── Task list pages ──
+  if (data.startsWith('tasks_p_')) {
+    const p = parseInt(data.split('_').pop())
+    const { text, kb } = await buildTaskPage(p, 'all')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+  if (data.startsWith('tasks_done_')) {
+    const p = parseInt(data.split('_').pop())
+    const { text, kb } = await buildTaskPage(p, 'done')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+  if (data.startsWith('tasks_hi_')) {
+    const p = parseInt(data.split('_').pop())
+    const { text, kb } = await buildTaskPage(p, 'hi')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+
+  // ── Event list pages ──
+  if (data.startsWith('events_p_')) {
+    const p = parseInt(data.split('_').pop())
+    const { text, kb } = await buildEventPage(p)
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+
+  // ── Reminder pages ──
+  if (data.startsWith('reminders_p_')) {
+    const p = parseInt(data.split('_').pop())
+    const { text, kb } = await buildReminderPage(p)
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+
+  // ── Add prompts ──
+  if (data === 'task_add') {
+    await edit(chatId, msgId,
+      `📝 *Add a Task*\n\n_Just type naturally or use a command:_\n\n• \`/add Buy groceries\`\n• \`/add Call doctor tomorrow 3pm\`\n• Or just send: _"Submit report by Friday"_`,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+  if (data === 'event_add') {
+    await edit(chatId, msgId,
+      `📅 *Add an Event*\n\n• \`/event Team standup tomorrow 10am\`\n• Or just send: _"Meeting with Rahul Friday 4pm"_`,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+  if (data === 'task_search') {
+    await edit(chatId, msgId,
+      `🔍 *Search Tasks*\n\nSend: \`/search <keyword>\``,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+  if (data === 'task_bytag') {
+    const tasks = await taskService.listTasks({})
+    const tags = [...new Set(tasks.flatMap(t => t.tags || []))]
+    await edit(chatId, msgId,
+      tags.length
+        ? `🏷 *Filter by tag:*\n\nUse \`/search <tag>\` to find tasks by tag.\n\nAvailable tags:\n${tags.map(t => `• \`${t}\``).join('\n')}`
+        : `🏷 *No tags yet.*\n\nAdd tags using \`/tag <task-id> <tag>\``,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+
+  // ── Task actions ──
+  if (data.startsWith('t_done_')) {
+    const id = data.slice(7)
+    await taskService.completeTask(id)
+    await toast(query.id, '✅ Marked as done!')
+    const { text, kb } = await buildTaskPage(0, 'all')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+  if (data.startsWith('t_reopen_')) {
+    const id = data.slice(9)
+    await taskService.reopenTask(id)
+    await toast(query.id, '🔄 Task reopened!')
+    const { text, kb } = await buildTaskPage(0, 'all')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+  if (data.startsWith('t_edit_')) {
+    const id = data.slice(7)
+    const task = await taskService.getTask(id)
+    await edit(chatId, msgId,
+      `✏️ *Edit Task*\n\nCurrent: *${task?.title}*\n\nSend the new title:\n\`/update ${id} <new title>\``,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+  if (data.startsWith('t_confirmDel_')) {
+    const id = data.slice(13)
+    const task = await taskService.getTask(id)
+    await edit(chatId, msgId,
+      `⚠️ *Delete Task?*\n\n"${task?.title}"\n\nThis cannot be undone.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🗑 Yes, Delete', callback_data: `t_del_${id}` }, { text: '✗ Cancel', callback_data: 'tasks_p_0' }],
+          ],
+        },
+      }); return
+  }
+  if (data.startsWith('t_del_')) {
+    const id = data.slice(6)
+    await taskService.deleteTask(id)
+    await toast(query.id, '🗑 Task deleted!')
+    const { text, kb } = await buildTaskPage(0, 'all')
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+
+  // ── Event actions ──
+  if (data.startsWith('e_edit_')) {
+    const id = data.slice(7)
+    const ev = await eventService.getEvent(id)
+    await edit(chatId, msgId,
+      `✏️ *Edit Event*\n\nCurrent: *${ev?.title}*\n\nSend: \`/updateevent ${id} <new title>\``,
+      { reply_markup: { inline_keyboard: BACK_HOME } }); return
+  }
+  if (data.startsWith('e_confirmDel_')) {
+    const id = data.slice(13)
+    const ev = await eventService.getEvent(id)
+    await edit(chatId, msgId,
+      `⚠️ *Delete Event?*\n\n"${ev?.title}"\n\nThis cannot be undone.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🗑 Yes, Delete', callback_data: `e_del_${id}` }, { text: '✗ Cancel', callback_data: 'events_p_0' }],
+          ],
+        },
+      }); return
+  }
+  if (data.startsWith('e_del_')) {
+    const id = data.slice(6)
+    await eventService.deleteEvent(id)
+    await toast(query.id, '🗑 Event deleted!')
+    const { text, kb } = await buildEventPage(0)
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+
+  // ── Reminder delete ──
+  if (data.startsWith('r_confirmDel_')) {
+    const id = data.slice(13)
+    await edit(chatId, msgId, `⚠️ *Delete this reminder?*`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🗑 Yes, Delete', callback_data: `r_del_${id}` }, { text: '✗ Cancel', callback_data: 'reminders_p_0' }],
+          ],
+        },
+      }); return
+  }
+  if (data.startsWith('r_del_')) {
+    const id = data.slice(6)
+    await reminderService.deleteReminder(id)
+    await toast(query.id, '🗑 Reminder deleted!')
+    const { text, kb } = await buildReminderPage(0)
+    await edit(chatId, msgId, text, { reply_markup: kb }); return
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command + NLP handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GREETINGS = /^(hi|hello|hey|hii|helo|howdy|yo|sup|start)[!?.]*$/i
+
+async function handleMessage(chatId, text, firstName) {
+  const trimmed = text.trim()
+  const parts = trimmed.split(' ')
+  const cmd = parts[0].toLowerCase()
+  const rest = parts.slice(1).join(' ')
+
+  // Slash commands
+  if (cmd === '/start' || cmd === '/help' || GREETINGS.test(trimmed)) {
+    await showMainMenu(chatId, firstName); return
+  }
+
+  if (cmd === '/add') {
+    if (!rest) { await send(chatId, `❌ Usage: \`/add <title>\``); return }
+    const t = await taskService.createTask({ title: rest })
+    await send(chatId, `✅ *Task Created!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`, {
+      reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
+    }); return
   }
 
   if (cmd === '/update') {
-    const [id, ...titleParts] = rest.split(' ')
-    const newTitle = titleParts.join(' ')
-    if (!id || !newTitle) {
-      await sendMessage(chatId, `❌ Usage: \`/update <task-id> <new title>\``)
-      return
-    }
-    const t = await taskService.updateTask(id, { title: newTitle })
-    await sendMessage(chatId,
-      `✅ *Task Updated!*\n━━━━━━━━━━━━━━━━━━━━\n📝 *${t.title}*\n🆔 \`${t.id}\``,
-      { reply_markup: { inline_keyboard: [[{ text: '📋 View All Tasks', callback_data: 'menu_list_tasks' }], BACK[0]] } },
-    )
-    return
+    const [id, ...rest2] = rest.split(' ')
+    const title = rest2.join(' ')
+    if (!id || !title) { await send(chatId, `❌ Usage: \`/update <id> <new title>\``); return }
+    const t = await taskService.updateTask(id, { title })
+    await send(chatId, `✅ *Task Updated!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`, {
+      reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }]] },
+    }); return
+  }
+
+  if (cmd === '/updateevent') {
+    const [id, ...rest2] = rest.split(' ')
+    const title = rest2.join(' ')
+    if (!id || !title) { await send(chatId, `❌ Usage: \`/updateevent <id> <new title>\``); return }
+    const e = await eventService.updateEvent(id, { title })
+    await send(chatId, `✅ *Event Updated!*\n\n📅 *${e.title}*`, {
+      reply_markup: { inline_keyboard: [[{ text: '📅 My Events', callback_data: 'events_p_0' }]] },
+    }); return
   }
 
   if (cmd === '/tasks') {
-    const { text: listText, keyboard } = await buildTaskListMessage()
-    await sendMessage(chatId, listText, { reply_markup: { inline_keyboard: keyboard } })
-    return
+    const { text: t, kb } = await buildTaskPage(0, 'all')
+    await send(chatId, t, { reply_markup: kb }); return
   }
 
   if (cmd === '/event') {
-    if (!rest) {
-      await sendMessage(chatId, `❌ Usage: \`/event <title>\``)
-      return
-    }
-    const ev = await eventService.createEvent({ title: rest, startDate: new Date().toISOString() })
-    await sendMessage(chatId,
-      `✅ *Event Created!*\n━━━━━━━━━━━━━━━━━━━━\n📅 *${ev.title}*\n🆔 \`${ev.id}\``,
-      { reply_markup: { inline_keyboard: BACK } },
-    )
-    return
+    if (!rest) { await send(chatId, `❌ Usage: \`/event <title>\``); return }
+    const date = extractDate(rest) || new Date().toISOString()
+    const e = await eventService.createEvent({ title: rest, startDate: date })
+    await send(chatId, `✅ *Event Created!*\n━━━━━━━━━━━━━━━━━━━━\n${eventCard(e, 1)}`, {
+      reply_markup: { inline_keyboard: [[{ text: '📅 My Events', callback_data: 'events_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] },
+    }); return
   }
 
   if (cmd === '/done') {
-    if (!rest) { await sendMessage(chatId, `❌ Usage: \`/done <task-id>\``); return }
+    if (!rest) { await send(chatId, `❌ Usage: \`/done <id>\``); return }
     await taskService.completeTask(rest.trim())
-    await sendMessage(chatId, `✅ Task marked as *Completed!*`, { reply_markup: { inline_keyboard: [[{ text: '📋 View Tasks', callback_data: 'menu_list_tasks' }]] } })
-    return
+    await send(chatId, `✅ Task marked *Completed!*`, { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }]] } }); return
   }
 
   if (cmd === '/delete') {
-    if (!rest) { await sendMessage(chatId, `❌ Usage: \`/delete <task-id>\``); return }
+    if (!rest) { await send(chatId, `❌ Usage: \`/delete <id>\``); return }
     await taskService.deleteTask(rest.trim())
-    await sendMessage(chatId, `🗑️ Task *deleted.*`, { reply_markup: { inline_keyboard: [[{ text: '📋 View Tasks', callback_data: 'menu_list_tasks' }]] } })
-    return
+    await send(chatId, `🗑 Task *deleted.*`, { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }]] } }); return
   }
 
   if (cmd === '/search') {
-    if (!rest) { await sendMessage(chatId, `❌ Usage: \`/search <keyword>\``); return }
+    if (!rest) { await send(chatId, `❌ Usage: \`/search <keyword>\``); return }
     const all = await taskService.listTasks({})
-    const found = all.filter(t => t.title.toLowerCase().includes(rest.toLowerCase()))
-    if (!found.length) {
-      await sendMessage(chatId, `🔍 No tasks found for *"${rest}"*`, { reply_markup: { inline_keyboard: BACK } })
-      return
-    }
-    let msg = `🔍 *Found ${found.length} task(s) for "${rest}":*\n━━━━━━━━━━━━━━━━━━━━\n\n`
-    msg += found.map((t, i) => formatTaskCard(t, i + 1)).join('\n\n')
-    const keyboard = found.map(t => taskActionButtons(t))
-    keyboard.push(BACK[0])
-    await sendMessage(chatId, msg, { reply_markup: { inline_keyboard: keyboard } })
-    return
+    const found = all.filter(t => t.title.toLowerCase().includes(rest.toLowerCase()) || (t.tags || []).includes(rest))
+    if (!found.length) { await send(chatId, `🔍 No tasks found for *"${rest}"*`); return }
+    let msg = `🔍 *Found ${found.length} task(s):*\n━━━━━━━━━━━━━━━━━━━━\n\n`
+    msg += found.map((t, i) => taskCard(t, i + 1)).join('\n\n')
+    const kb = { inline_keyboard: [...found.map(t => taskActionRow(t)), BACK_HOME[0]] }
+    await send(chatId, msg, { reply_markup: kb }); return
   }
 
-  await sendMessage(chatId, `❓ Unknown command. Tap below to see options.`, { reply_markup: { inline_keyboard: BACK } })
+  if (cmd === '/tag') {
+    const [id, tag] = rest.split(' ')
+    if (!id || !tag) { await send(chatId, `❌ Usage: \`/tag <id> <tag>\``); return }
+    await taskService.addTag(id, tag)
+    await send(chatId, `🏷 Tag *"${tag}"* added!`); return
+  }
+
+  // ── Natural language fallback ──
+  if (!trimmed.startsWith('/')) {
+    const intent = detectIntent(trimmed)
+    const date = extractDate(trimmed)
+    const title = cleanTitle(trimmed)
+
+    if (intent === 'reminder') {
+      await send(chatId,
+        `🔔 *Reminder detected!*\n\n"${trimmed}"\n\nTo set a reminder, link it to a task ID:\n\`/remind <task-id> <date>\`\n\nOr tap below to create a task first:`,
+        { reply_markup: { inline_keyboard: [[{ text: '📝 Create Task First', callback_data: 'task_add' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+      ); return
+    }
+
+    if (intent === 'event') {
+      const startDate = date || new Date().toISOString()
+      const e = await eventService.createEvent({ title: title || trimmed, startDate })
+      await send(chatId,
+        `✅ *Event Created from your message!*\n━━━━━━━━━━━━━━━━━━━━\n${eventCard(e, 1)}`,
+        { reply_markup: { inline_keyboard: [[{ text: '📅 My Events', callback_data: 'events_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+      ); return
+    }
+
+    // Default: task
+    const t = await taskService.createTask({ title: title || trimmed, dueDate: date })
+    await send(chatId,
+      `✅ *Task Created from your message!*\n━━━━━━━━━━━━━━━━━━━━\n${taskCard(t, 1)}`,
+      { reply_markup: { inline_keyboard: [[{ text: '📋 My Tasks', callback_data: 'tasks_p_0' }, { text: '🏠 Home', callback_data: 'menu_home' }]] } }
+    ); return
+  }
+
+  await send(chatId, `❓ Unknown command.`, { reply_markup: { inline_keyboard: BACK_HOME } })
 }
 
-// ── Main handler ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Main handler
+// ─────────────────────────────────────────────────────────────────────────────
 
 export async function POST(request) {
   try {
@@ -373,7 +772,7 @@ export async function POST(request) {
       const q = body.callback_query
       const from = q.from || {}
       await upsertTelegramUser({ telegramId: String(from.id), username: from.username, firstName: from.first_name, lastName: from.last_name })
-      await handleCallbackQuery(q)
+      await handleCallback(q)
       return NextResponse.json({ ok: true })
     }
 
@@ -383,9 +782,10 @@ export async function POST(request) {
     const from = message.from || {}
     const chatId = message.chat.id
     const text = message.text || ''
+    if (!text) return NextResponse.json({ ok: true })
 
     await upsertTelegramUser({ telegramId: String(from.id), username: from.username, firstName: from.first_name, lastName: from.last_name })
-    await handleCommand(chatId, text, from.first_name)
+    await handleMessage(chatId, text, from.first_name)
 
     return NextResponse.json({ ok: true })
   } catch (err) {
