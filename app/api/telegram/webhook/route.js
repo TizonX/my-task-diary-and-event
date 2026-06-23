@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import { NextResponse } from 'next/server'
 import { upsertTelegramUser } from '../../../../server/repositories/telegramUserRepository'
 import * as taskService from '../../../../server/services/taskService'

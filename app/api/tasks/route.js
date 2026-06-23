@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import { NextResponse } from 'next/server'
 import * as taskService from '../../../server/services/taskService'
 import { rateLimit } from '../../../server/utils/rateLimit'
