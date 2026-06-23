@@ -7,7 +7,7 @@ function Hero() {
         <h1 className="text-4xl sm:text-5xl font-extrabold mb-4">My Task Diary & Event</h1>
         <p className="text-lg text-slate-600 dark:text-slate-300 max-w-2xl mx-auto">Telegram-first productivity: create tasks and events directly from Telegram and receive smart reminders powered by AI.</p>
         <div className="mt-8 flex justify-center gap-4">
-          <a href="https://t.me/your_bot_username" className="inline-flex items-center px-6 py-3 bg-purple-600 text-white rounded-lg shadow hover:bg-purple-700 transition">Open in Telegram</a>
+          <a href="https://t.me/my_task_diary_and_event_bot" className="inline-flex items-center px-6 py-3 bg-purple-600 text-white rounded-lg shadow hover:bg-purple-700 transition">Open in Telegram</a>
         </div>
       </div>
     </section>
